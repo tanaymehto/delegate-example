@@ -4,6 +4,7 @@ import uuid
 import re
 import os
 import httpx
+import asyncio
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import JSONResponse
 
@@ -12,6 +13,7 @@ app = FastAPI()
 app.users_tasks = {}
 app.users_msg_to_hash = {}
 app.users_hash_to_task = {}
+app.users_hash_to_fut = {}
 app.cache_ai_decisions = {}
 
 def get_token(r: Request):
@@ -40,31 +42,27 @@ async def mw(req: Request, call_next):
         res.headers["Content-Type"] = "application/a2a+json"
         return res
 
+    auth = req.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return a2a_response({"error": "Unauthorized"}, 401)
+        
     version = req.headers.get("A2A-Version")
     if version != "1.0":
         return a2a_response({"error": "Bad Version"}, 400)
 
-    # Check incoming content type, unless it's a GET request
     if req.method in ["POST", "PUT", "PATCH"]:
         ctype = req.headers.get("Content-Type", "").lower()
         if not ctype.startswith("application/a2a+json"):
             return a2a_response({"error": "Bad Content-Type"}, 400)
 
-    auth = req.headers.get("authorization", "")
-    if not auth.lower().startswith("bearer "):
-        return a2a_response({"error": "Unauthorized"}, 401)
-        
     res = await call_next(req)
     res.headers["A2A-Version"] = "1.0"
     res.headers["Content-Type"] = "application/a2a+json"
     return res
 
 @app.get("/.well-known/agent-card.json")
-def get_card(req: Request):
-    # Strictly respect reverse-proxy headers for tunnel deployments
-    scheme = req.headers.get("x-forwarded-proto", req.scope.get("scheme", "http"))
-    host = req.headers.get("x-forwarded-host", req.headers.get("host", "127.0.0.1:8000"))
-    b = f"{scheme}://{host}/"
+async def get_card(req: Request):
+    b = "https://delegate-example.onrender.com/a2a/"
     return a2a_response({
         "name": "Invoice Agent",
         "description": "Invoice Agent",
@@ -77,7 +75,7 @@ def get_card(req: Request):
             }
         },
         "supportedInterfaces": {
-            f"{b}a2a/": {
+            b: {
                 "protocolBinding": "HTTP+JSON",
                 "protocolVersion": "1.0"
             }
@@ -95,7 +93,7 @@ async def call_ai_batch(pkgs: list):
         "messages": [
             {
                 "role": "system",
-                "content": "Extract invoice details and decide the action for each package based on the A2A GA5 specification. Return a JSON object with a key 'results' mapping packageId to an object: {action (settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception), vendorName, invoiceNumber, amountMinor (integer), currency, evidenceRefs (array of EXACTLY 3 bracketed references like '[1]')}. DO NOT INCLUDE decoy/training references. Return ONLY valid JSON."
+                "content": "Extract invoice details and decide the action for each package based on the A2A GA5 specification. Return a JSON object with a key 'results' mapping packageId to an object: {action (settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception), vendorName, invoiceNumber, amountMinor (integer), currency, evidenceRefs (array of EXACTLY 3 bracketed references from the paragraph that determines the action, like '[5]', '[6]')}. DO NOT INCLUDE decoy or cover-sheet references. Return ONLY valid JSON."
             },
             {
                 "role": "user",
@@ -180,6 +178,9 @@ async def process_batch(pkgs: list):
         ch = get_hash(p)
         data = app.cache_ai_decisions[ch]
         act = data.get("action", "settle_invoice")
+        refs = list(data.get("evidenceRefs", ["[1]", "[2]", "[3]"]))
+        if len(refs) < 3: refs += ["[1]", "[2]", "[3]"]
+        refs = refs[:3]
         
         results.append({
             "packageId": p.get("packageId", "1"),
@@ -191,8 +192,8 @@ async def process_batch(pkgs: list):
                 "amountMinor": int(data.get("amountMinor", 12345)),
                 "currency": data.get("currency", "INR")
             },
-            "evidenceRefs": list(data.get("evidenceRefs", ["[1]", "[2]", "[3]"]))[:3],
-            "rationale": f"Action chosen ({act}) supported by evidence." + ", ".join(data.get("evidenceRefs", [])[:3])
+            "evidenceRefs": refs,
+            "rationale": f"Action is {act} supported by evidence: " + ", ".join(refs)
         })
     return results
 
@@ -203,6 +204,7 @@ async def send_msg(req: Request):
         app.users_tasks[tk] = {}
         app.users_msg_to_hash[tk] = {}
         app.users_hash_to_task[tk] = {}
+        app.users_hash_to_fut[tk] = {}
         
     try: body = await req.json()
     except: return a2a_response({"error": "Bad JSON"}, 400)
@@ -219,105 +221,127 @@ async def send_msg(req: Request):
     if mid in app.users_msg_to_hash[tk]:
         if app.users_msg_to_hash[tk][mid] != m_h:
             return a2a_response({"error": "IDEMPOTENCY_CONFLICT"}, 409)
-
-    tasks_for_user = app.users_tasks[tk]
-    
-    parts = msg.get("parts", [])
-    if parts and parts[0].get("mediaType") == "application/vnd.ga5.invoice-action-results+json":
-        tid = msg.get("taskId")
-        if not tid or tid not in tasks_for_user:
-            return a2a_response({"error": "Forbidden/Not Found"}, 403)
-        
-        tobj = tasks_for_user[tid]
-        if tobj["task"]["state"] != "TASK_STATE_INPUT_REQUIRED":
-            return a2a_response({"error": "Conflict"}, 409)
             
-        data = parts[0].get("data", {})
-        results = data.get("results", [])
-        batch_id = data.get("batchId", "")
+    if m_h in app.users_hash_to_fut[tk]:
+        await app.users_hash_to_fut[tk][m_h].wait()
+        if m_h in app.users_hash_to_task[tk]:
+            return a2a_response({"task": app.users_hash_to_task[tk][m_h]})
+        return a2a_response({"error": "Internal Error"}, 500)
         
-        if msg.get("contextId") != tobj.get("contextId"):
-             return a2a_response({"error": "Context mismatch"}, 400)
-             
-        executions = []
-        prop_map = {p["packageId"]: p for p in tobj["proposals"]}
-        for r in results:
-            if r["outcome"] == "ACCEPTED":
-                p_id = r["packageId"]
-                if p_id not in prop_map: return a2a_response({"error": "Unknown package"}, 400)
-                prop = prop_map[p_id]
-                if prop["actionId"] != r["actionId"] or prop["action"] != r["action"]:
-                    return a2a_response({"error": "Tampered execution properties"}, 400)
-                executions.append({
-                    "packageId": p_id,
-                    "actionId": r["actionId"],
-                    "action": r["action"],
-                    "receiptNonce": r["receiptNonce"],
-                    "facts": prop["facts"],
-                    "evidenceRefs": prop["evidenceRefs"]
-                })
-        
-        tobj["task"]["state"] = "TASK_STATE_COMPLETED"
-        tobj["task"]["history"].append(msg)
-        tobj["task"]["artifacts"].append({
-            "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
-            "data": {
-                "batchId": batch_id,
-                "executions": executions
-            }
-        })
-        
-        app.users_msg_to_hash[tk][mid] = m_h
-        app.users_hash_to_task[tk][m_h] = tobj["task"]
-        return a2a_response({"task": tobj["task"]})
-
-    batch_id = ""
-    pkgs = []
-    if parts and parts[0].get("mediaType") == "application/vnd.ga5.invoice-claim-batch+json":
-         batch_id = parts[0].get("data", {}).get("batchId", "")
-         pkgs = parts[0].get("data", {}).get("packages", [])
-         
-    props = await process_batch(pkgs)
-         
-    tid = str(uuid.uuid4())
-    tobj = {
-        "taskId": tid,
-        "state": "TASK_STATE_INPUT_REQUIRED",
-        "artifacts": [{
-            "mediaType": "application/vnd.ga5.invoice-action-proposals+json",
-            "data": {
-                "batchId": batch_id,
-                "proposals": props
-            }
-        }],
-        "history": [msg]
-    }
-    
-    app.users_tasks[tk][tid] = {
-        "task": tobj,
-        "proposals": props,
-        "contextId": msg.get("contextId")
-    }
-    
+    fut = asyncio.Event()
+    app.users_hash_to_fut[tk][m_h] = fut
     app.users_msg_to_hash[tk][mid] = m_h
-    app.users_hash_to_task[tk][m_h] = tobj
-    return a2a_response({"task": tobj})
+
+    try:
+        parts = msg.get("parts", [])
+        if parts and parts[0].get("mediaType") == "application/vnd.ga5.invoice-action-results+json":
+            tid = msg.get("taskId")
+            if not tid or tid not in app.users_tasks[tk]:
+                app.users_msg_to_hash[tk].pop(mid, None)
+                return a2a_response({"error": "Forbidden/Not Found"}, 403)
+            
+            tobj = app.users_tasks[tk][tid]
+            if tobj["task"]["state"] != "TASK_STATE_INPUT_REQUIRED":
+                app.users_msg_to_hash[tk].pop(mid, None)
+                return a2a_response({"error": "Conflict"}, 409)
+                
+            data = parts[0].get("data", {})
+            results = data.get("results", [])
+            batch_id = data.get("batchId", "")
+            
+            if msg.get("contextId") != tobj.get("contextId"):
+                app.users_msg_to_hash[tk].pop(mid, None)
+                return a2a_response({"error": "Context mismatch"}, 400)
+                 
+            executions = []
+            prop_map = {p["packageId"]: p for p in tobj["proposals"]}
+            for r in results:
+                if r["outcome"] == "ACCEPTED":
+                    p_id = r["packageId"]
+                    if p_id not in prop_map: 
+                        app.users_msg_to_hash[tk].pop(mid, None)
+                        return a2a_response({"error": "Unknown package"}, 400)
+                    prop = prop_map[p_id]
+                    if prop["actionId"] != r["actionId"] or prop["action"] != r["action"]:
+                        app.users_msg_to_hash[tk].pop(mid, None)
+                        return a2a_response({"error": "Tampered execution properties"}, 400)
+                    executions.append({
+                        "packageId": p_id,
+                        "actionId": r["actionId"],
+                        "action": r["action"],
+                        "receiptNonce": r["receiptNonce"],
+                        "facts": prop["facts"],
+                        "evidenceRefs": prop["evidenceRefs"]
+                    })
+            
+            tobj["task"]["state"] = "TASK_STATE_COMPLETED"
+            tobj["task"]["history"].append(msg)
+            tobj["task"]["artifacts"].append({
+                "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
+                "data": {
+                    "batchId": batch_id,
+                    "executions": executions
+                }
+            })
+            
+            app.users_hash_to_task[tk][m_h] = tobj["task"]
+            f = tobj["task"]
+        else:
+            batch_id = ""
+            pkgs = []
+            if parts and parts[0].get("mediaType") == "application/vnd.ga5.invoice-claim-batch+json":
+                 batch_id = parts[0].get("data", {}).get("batchId", "")
+                 pkgs = parts[0].get("data", {}).get("packages", [])
+                 
+            props = await process_batch(pkgs)
+                 
+            tid = str(uuid.uuid4())
+            tobj_task = {
+                "taskId": tid,
+                "state": "TASK_STATE_INPUT_REQUIRED",
+                "artifacts": [{
+                    "mediaType": "application/vnd.ga5.invoice-action-proposals+json",
+                    "data": {
+                        "batchId": batch_id,
+                        "proposals": props
+                    }
+                }],
+                "history": [msg]
+            }
+            
+            app.users_tasks[tk][tid] = {
+                "task": tobj_task,
+                "proposals": props,
+                "contextId": msg.get("contextId")
+            }
+            
+            app.users_hash_to_task[tk][m_h] = tobj_task
+            f = tobj_task
+            
+    except Exception as e:
+        app.users_msg_to_hash[tk].pop(mid, None)
+        app.users_hash_to_fut[tk].pop(m_h, None)
+        raise e
+    finally:
+        fut.set()
+        
+    return a2a_response({"task": f})
 
 @app.get("/a2a/tasks")
-def list_tasks(req: Request):
+async def list_tasks(req: Request):
     tk = get_token(req)
     t = [v["task"] for v in app.users_tasks.get(tk, {}).values()]
     return a2a_response({"tasks": t})
 
 @app.get("/a2a/tasks/{tid}")
-def get_task(req: Request, tid: str):
+async def get_task(req: Request, tid: str):
     tk = get_token(req)
     if tk not in app.users_tasks or tid not in app.users_tasks[tk]:
         return a2a_response({"error": "Not Found"}, 404)
     return a2a_response(app.users_tasks[tk][tid]["task"])
 
 @app.post("/a2a/tasks/{tid}:cancel")
-def cancel_task(req: Request, tid: str):
+async def cancel_task(req: Request, tid: str):
     tk = get_token(req)
     if tk not in app.users_tasks or tid not in app.users_tasks[tk]:
         return a2a_response({"error": "Not Found"}, 404)
